@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "llmsearcher"
+version = "0.1.0"
+description = "web with a LLM,to be a smart one"
+authors = ["GUIGUIzc <862121801@qq.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+selenium = "^4.27.1"
+openai = "^1.58.1"
+webdriver-manager = "^4.0.2"
+streamlit = "^1.41.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
