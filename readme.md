@@ -1,6 +1,6 @@
 本项目为NUTT开源项目，遵循GPL-3.0协议，欢迎大家使用和贡献。
 
-![](E:\git\LLMSearcher\example.png)
+![](example.png)
 
 LLM-Searcher 是一个基于LLM的搜索引擎，可以自动执行搜索任务，并返回搜索结果。
 
