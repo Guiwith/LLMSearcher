@@ -22,7 +22,7 @@ class ActionType(Enum):
     """严格定义所有可能的动作类型"""
     SEARCH = "search"
     CLICK_RESULT = "click_result"
-    CLICK_NEXT = "click_next"     # 点击下一个搜索结果
+    CLICK_NEXT = "click_next"     # 添加翻页动作
     EXTRACT_TEXT = "extract_text"
     BACK = "back"                 # 返回上一页
     VERIFY = "verify"            # 验证当前页面
@@ -68,43 +68,45 @@ class TaskParser:
         return [
             {
                 "role": "system",
-                "content": """你是一个任务规划器。你的输出必须是单个、完整、合法的JSON对象。
-
-输出格式：
-{"steps":[{"action":"动作名","params":{"参数名":"参数值"}},...]}
+                "content": """你是一个JSON生成器。必须严格按照以下格式输出：
+{"steps":[{"action":"动作名","params":{"参数名":"参数值"}}]}
 
 严格规则：
-1. 动作类型仅限以下四种：
-- search: 搜索操作
-- click_result: 点击搜索结果
-- extract_text: 提取文本
-- back: 返回上一页
-
-2. 每种动作的参数格式：
-search: {"keywords":"搜索词"}
-click_result: {"index":0,"link_text":"要点击的标题"}
-extract_text: {"selector":".css选择器","attribute":"text"}
-back: {}
-
-3. 完整示例：
-{"steps":[{"action":"search","params":{"keywords":"Python教程"}},{"action":"click_result","params":{"index":0,"link_text":"Python"}},{"action":"extract_text","params":{"selector":".content","attribute":"text"}},{"action":"back","params":{}}]}
-
-4. 格式要求：
-- 必须是合法的JSON
-- 必须包含steps数组
+1. JSON结构：
+- 只能有一个根对象
+- 根对象只能有一个steps数组
 - 每个步骤必须有action和params
-- 不能省略大括号或引号
-- 不能包含注释或换行
-- 不能使用markdown标记
-- 不能有多余空格
+- 不能有多余的大括号
+- 不能有注释或换行
 
-5. 禁止事项：
-- 不能有多个steps数组
-- 不能嵌套steps数组
+2. 动作类型和参数：
+search: {"action":"search","params":{"keywords":"搜索词"}}
+click_result: {"action":"click_result","params":{"index":0,"link_text":"标题"}}
+click_next: {"action":"click_next","params":{"page":2}}  # 翻到指定页
+extract_text: {"action":"extract_text","params":{"selector":"选择器","attribute":"text"}}
+back: {"action":"back","params":{}}
+
+3. 标准示例：
+{"steps":[
+{"action":"search","params":{"keywords":"Python教程"}},
+{"action":"click_result","params":{"index":0,"link_text":"Python"}},
+{"action":"extract_text","params":{"selector":".content","attribute":"text"}},
+{"action":"back","params":{}},
+{"action":"click_next","params":{"page":2}},
+{"action":"click_result","params":{"index":0,"link_text":"Python入门"}},
+{"action":"extract_text","params":{"selector":".content","attribute":"text"}},
+{"action":"back","params":{}}
+]}
+
+4. 严格禁止：
+- 不能有多个大括号开头
+- 不能使用markdown代码块
+- 不能包含换行符
+- 不能有多余空格
+- 不能省略引号
 - 不能改变JSON结构
 - 不能添加其他字段
-- 不能使用未定义的动作类型
-- 不能省略必需的参数"""
+- 不能使用未定义的动作"""
             },
             {
                 "role": "user",
@@ -190,7 +192,7 @@ back: {}
                                 if 'action' not in step:
                                     continue
                                 
-                                # 如果没有params，添加空对象
+                                # 如果没有params，加空对象
                                 if 'params' not in step:
                                     step['params'] = {}
                             
@@ -433,7 +435,14 @@ class WorkAssistant(LLMClient):
         self.logger.info(f"执行步骤: {step}")
         try:
             if step.action == ActionType.SEARCH:
-                return self._execute_search(step.params)
+                success = self._execute_search(step.params)
+                if not success:
+                    self.logger.error("搜索步骤失败")
+                    return False
+                # 搜索成功后等待页面稳定
+                time.sleep(2)
+                return True
+            
             elif step.action == ActionType.CLICK_RESULT:
                 return self._execute_click_result(step.params)
             elif step.action == ActionType.EXTRACT_TEXT:
@@ -443,6 +452,7 @@ class WorkAssistant(LLMClient):
             else:
                 self.logger.error(f"未知的动作类型: {step.action}")
                 return False
+            
         except Exception as e:
             self.logger.error(f"步骤执行失败: {e}")
             return False
@@ -450,26 +460,43 @@ class WorkAssistant(LLMClient):
     def _execute_search(self, params: SearchParams) -> bool:
         """执行搜索操作"""
         try:
+            # 1. 等待搜索框出现并输入关键词
             search_box = self.wait.until(
                 EC.presence_of_element_located((By.ID, "kw"))
             )
             search_box.clear()
             search_box.send_keys(params.keywords)
             
+            # 2. 等待搜索按钮可点击并点击
             search_button = self.wait.until(
                 EC.element_to_be_clickable((By.ID, "su"))
             )
             search_button.click()
             
-            # 等待搜索结果加载
-            self.wait.until(
-                EC.presence_of_element_located((By.CLASS_NAME, "result"))
-            )
-            return True
-            
-        except TimeoutException:
-            self.logger.error("搜索操作超时")
-            return False
+            # 3. 等待搜索结果加载完成
+            try:
+                # 等待搜索结果出现
+                self.wait.until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "result"))
+                )
+                
+                # 等待加载动画消失
+                self.wait.until_not(
+                    EC.presence_of_element_located((By.CLASS_NAME, "loading"))
+                )
+                
+                # 确保至少有一个搜索结果
+                results = self.driver.find_elements(By.CLASS_NAME, "result")
+                if not results:
+                    self.logger.warning("未找到搜索结果")
+                    return False
+                    
+                return True
+                
+            except TimeoutException:
+                self.logger.error("搜索结果加载超时")
+                return False
+                
         except Exception as e:
             self.logger.error(f"搜索操作失败: {e}")
             return False
@@ -508,7 +535,7 @@ class WorkAssistant(LLMClient):
 输入：目标:百度 URL:news.baidu.com
 输出：{"is_correct":false,"reason":"这是百度新闻子域名，不是主站"}
 
-禁止事项：
+禁止事���：
 - 不能有多余空格
 - 不能有换行
 - 不能有注释
@@ -573,12 +600,12 @@ class WorkAssistant(LLMClient):
             prompt = [
                 {
                     "role": "system",
-                    "content": """你是一个搜索结果匹配专家。判断搜索结果是否符合用户需求。必须严格按照以下格式输出：
+                    "content": """你是一个搜索��果匹配专家。判断搜索结果是否符合用户需求。必须严格按照以下格式输出：
 {"should_click":true/false,"reason":"原因"}
 
 判断规则：
 1. 内容相关性：标题是否包含相关信息
-2. 来源可靠性：是否是可靠的��站
+2. 来源可靠性：是否是可靠的网站
 3. 信息完整性：是否包含完整信息
 
 示例1：
@@ -610,7 +637,7 @@ class WorkAssistant(LLMClient):
             return bool(result.get('should_click', False))
             
         except Exception as e:
-            self.logger.error(f"结果配判断失败: {e}")
+            self.logger.error(f"结果匹配判断失败: {e}")
             return False
 
     def _execute_click_result(self, params: ClickParams) -> bool:
@@ -805,50 +832,125 @@ class WorkAssistant(LLMClient):
             self.logger.error(f"任务规划失败: {e}")
             raise
 
-    def execute_task(self, task: str) -> str:
-        """执行完整任务流程并返回整理后的内容"""
+    def _execute_click_next(self, params: dict) -> bool:
+        """执行翻页操作"""
         try:
-            # 先进行任务规划
-            planned_task = self.plan_task(task)
-            self.logger.info(f"任务规划结果: {planned_task}")
+            # 百度搜索结果翻页有多种可能的选择器
+            next_page_selectors = [
+                "a#page-next",  # ID选择器
+                ".page-next",   # 类选择器
+                "a.n",         # 下一页链接
+                "[class='n']"  # 属性选择器
+            ]
             
-            # 在执行任务前初始化浏览器
-            self.setup_driver()
-            self.driver.get("https://www.baidu.com")
-            
-            # 解析任务
-            steps = self.parse_task(planned_task)
-            self.current_task = TaskPlan(
-                steps=steps,
-                task_id=str(time.time()),
-                created_at=time.time()
-            )
-            
-            # 执行每个步骤
-            for step in steps:
-                success = self.execute_step(step)
-                if not success:
-                    self.logger.error(f"步骤执行失败: {step}")
-                    break
-            
-            # 如果收集到信息则进行整理
-            if self.collected_info:
-                result = self.format_collected_info(self.collected_info, task)
-            else:
-                result = "未能集到任何信息"
-            
-            # 根据设置决定是否关闭浏览器
-            if self.auto_close_browser:
-                self.close()
+            for selector in next_page_selectors:
+                try:
+                    next_button = self.wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    if next_button and next_button.is_displayed():
+                        next_button.click()
+                        time.sleep(2)  # 等待页面加载
+                        
+                        # 验证页面是否加载完成
+                        self.wait.until(
+                            EC.presence_of_element_located((By.CLASS_NAME, "result"))
+                        )
+                        return True
+                except:
+                    continue
                 
-            return result
+            self.logger.warning("未找到下一页按钮")
+            return False
             
         except Exception as e:
-            self.logger.error(f"任务执行失败: {e}")
-            # 发生错误时也根据设置决定是否关闭浏览器
-            if self.auto_close_browser:
-                self.close()
-            raise
+            self.logger.error(f"翻页失败: {e}")
+            return False
+
+    def cleanup_browser_state(self):
+        """清理浏览器状态"""
+        if self.driver:
+            try:
+                # 关闭除主窗口外的所有窗口
+                while len(self.driver.window_handles) > 1:
+                    self.driver.switch_to.window(self.driver.window_handles[-1])
+                    self.driver.close()
+                # 切回主窗口
+                self.driver.switch_to.window(self.driver.window_handles[0])
+                # 返回搜索页
+                self.driver.get("https://www.baidu.com")
+            except Exception as e:
+                self.logger.error(f"浏览器状态清理失败: {e}")
+
+    def execute_task(self, task: str, max_retries: int = 3, max_pages: int = 3) -> Optional[str]:
+        """执行任务，支持翻页和重试机制"""
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"开始第 {attempt + 1} 次尝试执行任务")
+                
+                # 1. 任务解析
+                steps = self.parse_task(task)
+                if not steps:
+                    self.logger.error("任务解��失败")
+                    continue
+                
+                # 2. 初始化浏览器
+                if not self.driver:
+                    self.setup_driver()
+                self.driver.get("https://www.baidu.com")
+                
+                # 3. 执行搜索和收集结果
+                collected_texts = []
+                current_page = 1
+                
+                # 首先执行搜索
+                search_step = next((step for step in steps if step.action == ActionType.SEARCH), None)
+                if search_step:
+                    if not self.execute_step(search_step):
+                        raise ValueError("搜索步骤执行失败")
+                
+                while current_page <= max_pages and len(collected_texts) < 3:
+                    # 在每一页执行除搜索外的其他步骤
+                    for step in steps:
+                        if step.action == ActionType.SEARCH:
+                            continue  # 跳过搜索步骤
+                            
+                        elif step.action == ActionType.EXTRACT_TEXT:
+                            try:
+                                elements = self.driver.find_elements(By.CSS_SELECTOR, step.params.selector)
+                                text = "\n".join([elem.text for elem in elements if elem.text.strip()])
+                                if text:
+                                    collected_texts.append(text)
+                            except Exception as e:
+                                self.logger.warning(f"文本提取失败: {e}")
+                    
+                        elif step.action == ActionType.CLICK_NEXT:
+                            if current_page < max_pages:
+                                if self._execute_click_next(step.params):
+                                    current_page += 1
+                                else:
+                                    break
+                        else:
+                            if not self.execute_step(step):
+                                self.logger.warning(f"步骤执行失败: {step}")
+                
+                # 4. 验证最终结果
+                if collected_texts:
+                    final_result = "\n".join(collected_texts)
+                    if self.verify_result(task, final_result):
+                        self.logger.info(f"任务执行成功，收集了 {len(collected_texts)} 个结果")
+                        return final_result
+                
+                self.logger.warning(f"第 {attempt + 1} 次结果验证失败，准备重试")
+                self.cleanup_browser_state()
+                
+            except Exception as e:
+                self.logger.error(f"任务执行出错: {e}")
+                self.cleanup_browser_state()
+                continue
+                
+        self.logger.error(f"任务执行失败，已重试 {max_retries} 次")
+        return None
 
     def close(self) -> None:
         """清理资源"""
@@ -915,7 +1017,7 @@ class WorkAssistant(LLMClient):
 - 不能添加装饰性文字
 
 示例1：
-用���需求：收集视频标题
+用户需求：收集视频标题
 输出：
 【视频标题】
 1. xxx视频
