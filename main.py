@@ -68,43 +68,48 @@ class TaskParser:
         return [
             {
                 "role": "system",
-                "content": """你是一个任务规划器。你的输出必须是单个、完整、合法的JSON对象。
-
-输出格式：
-{"steps":[{"action":"动作名","params":{"参数名":"参数值"}},...]}
+                "content": """你是一个JSON生成器。必须严格按照以下格式输出单个JSON对象：
+{"steps":[{"action":"动作名","params":{"参数名":"参数值"}}]}
 
 严格规则：
-1. 动作类型仅限以下四种：
-- search: 搜索操作
+1. 只允许以下动作类型：
+- search: 搜索
 - click_result: 点击搜索结果
 - extract_text: 提取文本
 - back: 返回上一页
+- click_next: 翻页
 
-2. 每种动作的参数格式：
+2. 每个动作的标准参数格式：
 search: {"keywords":"搜索词"}
 click_result: {"index":0,"link_text":"要点击的标题"}
 extract_text: {"selector":".css选择器","attribute":"text"}
 back: {}
+click_next: {"page":2}
 
-3. 完整示例：
-{"steps":[{"action":"search","params":{"keywords":"Python教程"}},{"action":"click_result","params":{"index":0,"link_text":"Python"}},{"action":"extract_text","params":{"selector":".content","attribute":"text"}},{"action":"back","params":{}}]}
+3. 标准示例：
+{"steps":[
+{"action":"search","params":{"keywords":"Python"}},
+{"action":"click_result","params":{"index":0,"link_text":"Python教程"}},
+{"action":"extract_text","params":{"selector":".content","attribute":"text"}},
+{"action":"back","params":{}}
+]}
 
-4. 格式要求：
-- 必须是合法的JSON
-- 必须包含steps数组
-- 每个步骤必须有action和params
-- 不能省略大括号或引号
-- 不能包含注释或换行
-- 不能使用markdown标记
-- 不能有多余空格
-
-5. 禁止事项：
-- 不能有多个steps数组
-- 不能嵌套steps数组
-- 不能改变JSON结构
-- 不能添加其他字段
+4. 严格禁止：
 - 不能使用未定义的动作类型
-- 不能省略必需的参数"""
+- 不能在steps数组外添加其他字段
+- 不能嵌套多个steps数组
+- 不能省略params对象
+- 不能使用不完整的参数
+- 不能添加额外的逗号
+- 不能有多余的大括号
+
+5. 格式检查：
+- 必须以{"steps":[开始
+- 必须以]}结束
+- 每个动作必须有action和params
+- params必须是完整的对象
+- 不能有未闭合的括号
+- 不能有多余的字段"""
             },
             {
                 "role": "user",
@@ -544,7 +549,7 @@ class WorkAssistant(LLMClient):
                     content = clean_json(content)
                     
                     # 记录处理后的JSON
-                    self.logger.debug(f"处理后的JSON: {content}")
+                    self.logger.debug(f"处���后的JSON: {content}")
                     
                     try:
                         result = json.loads(content)
@@ -578,7 +583,7 @@ class WorkAssistant(LLMClient):
 
 判断规则：
 1. 内容相关性：标题是否包含相关信息
-2. 来源可靠性：是否是可靠的��站
+2. 来源可靠性：是否是可靠的站
 3. 信息完整性：是否包含完整信息
 
 示例1：
@@ -747,7 +752,7 @@ class WorkAssistant(LLMClient):
 2. 严格规则：
 - 搜索词必须简短精确（2-4个词）
 - 每个网站单独处理
-- 必须按顺序执行
+- 必须��顺序执行
 - 禁止添加任何说明文字
 
 3. 示例1：
@@ -915,7 +920,7 @@ class WorkAssistant(LLMClient):
 - 不能添加装饰性文字
 
 示例1：
-用���需求：收集视频标题
+用户需求：收集视频标题
 输出：
 【视频标题】
 1. xxx视频
