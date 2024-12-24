@@ -3,6 +3,24 @@ from main import WorkAssistant
 import json
 from datetime import datetime
 
+# 隐藏默认菜单和页脚
+st.set_page_config(
+    page_title="LLM Searcher",
+    page_icon="🤖",
+    layout="wide",
+    menu_items=None  # 这将隐藏默认菜单
+)
+
+# 隐藏Streamlit默认样式
+hide_st_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>
+"""
+st.markdown(hide_st_style, unsafe_allow_html=True)
+
 def init_session_state():
     if 'assistant' not in st.session_state:
         st.session_state.assistant = None
