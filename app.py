@@ -10,7 +10,7 @@ def init_session_state():
         st.session_state.task_results = []
 
 def main():
-    st.title("🤖 AI工作助手")
+    st.title("🤖 LLM Searcher")
     init_session_state()
 
     # 侧边栏配置
