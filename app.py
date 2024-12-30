@@ -1,5 +1,5 @@
 import streamlit as st
-from main import WorkAssistant
+from main import WorkAssistant, SearchConfig
 import json
 from datetime import datetime
 
@@ -39,15 +39,56 @@ def main():
         auto_close = st.checkbox("任务完成后自动关闭浏览器", value=True)
         headless = st.checkbox("使用无头模式（隐藏浏览器）", value=False)
         
+        # 添加搜索模式配置
+        st.subheader("搜索模式设置")
+        deep_search = st.checkbox("启用标准搜索模式", value=False, 
+                                help="启用后将对搜索结果进行深度分析和质量评估")
+        
+        # 当启用标准搜索模式时显示详细配置
+        if deep_search:
+            col1, col2 = st.columns(2)
+            with col1:
+                max_pages = st.number_input("最大搜索页数", 
+                                          min_value=1, 
+                                          max_value=10, 
+                                          value=3)
+                max_results = st.number_input("每页最大结果数", 
+                                            min_value=1, 
+                                            max_value=10, 
+                                            value=5)
+            with col2:
+                max_depth = st.number_input("最大搜索深度", 
+                                          min_value=1, 
+                                          max_value=3, 
+                                          value=2)
+                quality_threshold = st.slider("质量评分阈值", 
+                                           min_value=0.0, 
+                                           max_value=1.0, 
+                                           value=0.6, 
+                                           step=0.1)
+        
         if st.button("初始化助手"):
             try:
                 if st.session_state.assistant:
                     st.session_state.assistant.close()
+                
+                # 创建搜索配置
+                search_config = None
+                if deep_search:
+                    search_config = SearchConfig(
+                        deep_search=deep_search,
+                        max_pages=max_pages,
+                        max_results=max_results,
+                        max_depth=max_depth,
+                        quality_threshold=quality_threshold
+                    )
+                
                 st.session_state.assistant = WorkAssistant(
                     api_base=api_base, 
                     model=model,
                     auto_close_browser=auto_close,
-                    headless=headless
+                    headless=headless,
+                    search_config=search_config
                 )
                 st.success("助手初始化成功！")
             except Exception as e:

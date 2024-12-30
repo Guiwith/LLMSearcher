@@ -11,6 +11,7 @@ selenium = "^4.27.1"
 openai = "^1.58.1"
 webdriver-manager = "^4.0.2"
 streamlit = "^1.41.1"
+psutil = "^6.1.1"
 
 
 [build-system]
