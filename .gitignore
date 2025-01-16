@@ -3,3 +3,4 @@ venv/
 .gitignore
 .gitattributes
 poetry.lock
+basevenv/

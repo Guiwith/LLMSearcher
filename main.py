@@ -1,1422 +1,998 @@
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton, QProgressBar, QSizePolicy, QSplitter, QDialog, QLabel, QTableWidget, QTableWidgetItem, QTimeEdit, QHeaderView, QMessageBox
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTime, QTimer, QDateTime
+import sys
 from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
+from bs4 import BeautifulSoup
+import json
+import requests
+from typing import List, Dict
+from PyQt6.QtCore import QUrl
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import json
-import time
-import requests
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from typing import List, Dict, Any, Optional, Union
-from dataclasses import dataclass, asdict
-from enum import Enum
-import logging
-from selenium.common.exceptions import TimeoutException
-from datetime import datetime
-import re
-import functools
+from selenium.webdriver.common.by import By
 
-# 定义任务相关的数据结构
-class ActionType(Enum):
-    """严格定义所有可能的动作类型"""
-    SEARCH = "search"
-    CLICK_RESULT = "click_result"
-    CLICK_NEXT = "click_next"     # 点击下一个搜索结果
-    EXTRACT_TEXT = "extract_text"
-    BACK = "back"                 # 返回上一页
-    VERIFY = "verify"            # 验证当前页面
+class LLMBrowser:
+    def __init__(self, model: str = "glm4:latest"):
+        self.llm_url = "http://172.31.118.255:11434/v1/chat/completions"
+        self.headers = {"Content-Type": "application/json"}
+        self.model = model
+        
+    def _call_llm(self, prompt: str) -> str:
+        """调用Ollama API"""
+        try:
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            response = requests.post(self.llm_url, headers=self.headers, json=payload)
+            return response.json()["choices"][0]["message"]["content"]
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("无法连接到Ollama服务，请确保Ollama已启动且运行在端口11434")
+        except Exception as e:
+            raise Exception(f"调用LLM时发生错误: {str(e)}")
+    
+    def analyze_query(self, user_query: str) -> List[str]:
+        """分析用户需求,只回答1个最核心的用户可能想搜索的搜索关键词"""
+        prompt = f"""请分析以下需求,只回答1个最核心的用户可能想搜索的搜索关键词。
 
-@dataclass
-class SearchParams:
-    """搜索操作参数"""
-    keywords: str
-
-@dataclass
-class ClickParams:
-    """点击操作参数"""
-    index: str = "0"  # 默认点击第一个结果
-    link_text: str = ""  # 允许空的链接文本
-
-@dataclass
-class ExtractParams:
-    """提取操作参数"""
-    selector: str
-    attribute: str = "text"
-    keywords: str = ""
-
-@dataclass
-class Step:
-    """单个任务步骤"""
-    action: ActionType
-    params: Union[SearchParams, ClickParams, ExtractParams]
-    retry_count: int = 0
-    max_retries: int = 3
-
-@dataclass
-class TaskPlan:
-    """任务计划"""
-    steps: List[Step]
-    task_id: str
-    created_at: float
-
-@dataclass
-class SearchConfig:
-    """搜索配置"""
-    deep_search: bool = False  # 是否启用深度搜索
-    max_pages: int = 3        # 最大搜索页数
-    max_results: int = 5      # 每页最大结果数
-    max_depth: int = 2        # 最大深度
-    quality_threshold: float = 0.6  # 质量评分阈值
-
-class TaskParser:
-    """任务解析器"""
-    @classmethod
-    def get_prompt_template(cls, task: str) -> List[Dict[str, str]]:
-        """获取提示词模板"""
-        return [
-            {
-                "role": "system",
-                "content": """你是一个搜索任务规划器。必须严格按照以下规则输出JSON：
-
-输出格式规范：
-{
-  "steps": [
-    {
-      "action": "search",
-      "params": {
-        "keywords": "具体的搜索关键词"
-      }
-    },
-    {
-      "action": "click_result",
-      "params": {
-        "index": "0"
-      }
-    },
-    {
-      "action": "extract_text",
-      "params": {
-        "selector": ".content",
-        "attribute": "text"
-      }
-    },
-    {
-      "action": "back",
-      "params": {}
-    }
-  ]
-}
-
-严格规则：
-1. 动作类型限制：
-- search: 执行搜索，必须包含 keywords 参数
-- click_result: 点击结果，必须包含 index 参数（从0开始）
-- extract_text: 提取文本，必须包含 selector 和 attribute 参数
-- back: 返回上一页，无需参数
-
-2. 参数规范：
-search:
-- keywords: 必须是具体的中文搜索词，不能包含占位符
-- 禁止使用 [xxx] 这样的占位符
-
-click_result:
-- index: 必须是字符串格式的数字，如 "0", "1", "2"
-- 禁止使用变量或计算表达式
-
-extract_text:
-- selector: 必须是有效的CSS选择器，如 ".content", "article", ".text"
-- attribute: 必须是 "text"
-
-3. 禁止事项：
-- 不能使用未定义的动作类型
-- 不能省略任何必需的参数
-- 不能添加未定义的参数
-- 不能使用特殊字符或HTML标签
-- 不能包含注释
-- 不能使用换行或缩进
-- 不能使用markdown代码块
-
-4. 搜索关键词规则：
-- 必须使用中文
-- 必须具体明确
-- 必须包含完整信息
-- 禁止使用模糊词语
-- 长度不超过50个字符
-
-示例任务：搜索最新的AI新闻
 正确示例：
-{"steps":[{"action":"search","params":{"keywords":"人工智能最新发展新闻 2024"}},{"action":"click_result","params":{"index":"0"}},{"action":"extract_text","params":{"selector":".article","attribute":"text"}},{"action":"back","params":{}}]}
+用户需求：搜索哔哩哔哩，收集视频标题
+核心搜索关键词：哔哩哔哩
+
+用户需求：查找关于Python编程的入门教程
+核心搜索关键词：Python教程
+
+用户需求：寻找北京最好吃的火锅店推荐
+核心搜索关键词：北京火锅
 
 错误示例：
-{"steps":[{"action":"search","params":{"keywords":"[网站名]的AI新闻"}},{"action":"click","params":{"index":0}},{"action":"extract","params":{"selector":"div"}}]}"""
-            },
-            {
-                "role": "user",
-                "content": task
-            }
-        ]
+用户需求：搜索bilibili，收集视频标题
+错误关键词：bilibili视频标题（❌ 不要把目标动作加入关键词）
+正确关键词：bilibili（✓ 只需要目标网站名称）
 
-    @staticmethod
-    def parse_llm_response(response: str) -> List[Step]:
-        """解析LLM返回的JSON为Step列表"""
-        try:
-            # 1. 清理响应文本
-            def clean_response(text):
-                """清理和修复JSON响应，确保生成有效的JSON格式"""
-                try:
-                    # 1. 初始清理
-                    def initial_clean(text):
-                        # 移除markdown代码块标记
-                        text = re.sub(r'```.*?\n|```', '', text)
-                        # 移除所有空白字符
-                        text = re.sub(r'\s+', '', text)
-                        # 移除可能的注释
-                        text = re.sub(r'//.*?(?=\n|\r|$)|/\*.*?\*/', '', text)
-                        return text
-                    
-                    # 2. 提取JSON结构
-                    def extract_json(text):
-                        # 尝试找到完整的JSON结构
-                        pattern = r'\{.*"steps"\s*:\s*\[.*?\]\s*\}'
-                        match = re.search(pattern, text, re.DOTALL)
-                        if match:
-                            return match.group(0)
-                        return text
-                    
-                    # 3. 修复常见的JSON错误
-                    def fix_json_structure(text):
-                        
-                        # 确保键名有引号
-                        text = re.sub(r'([{,])(\w+):', r'\1"\2":', text)
-                        
-                        # 修复布尔值格式
-                        text = text.replace('True', 'true').replace('False', 'false')
-                        
-                        # 修复可能的中文引号
-                        text = text.replace('"', '"').replace('"', '"')
-                        
-                        return text
-                    
-                    # 4. 修复steps数组结构
-                    def fix_steps_array(text):
-                        # 确保steps数组存在且格式正确
-                        if '"steps":[' in text:
-                            # 计算左右方括号的数量
-                            left_brackets = text.count('[')
-                            right_brackets = text.count(']')
-                            
-                            # 如果方括号不匹配，添加缺失的右方括号
-                            if left_brackets > right_brackets:
-                                text += ']' * (left_brackets - right_brackets)
-                            
-                            # 确保JSON对象正确闭合
-                            if not text.endswith('}'):
-                                text += '}'
-                        
-                        return text
-                    
-                    # 5. 验证最终的JSON结构
-                    def validate_json(text):
-                        try:
-                            # 尝试解析JSON
-                            data = json.loads(text)
-                            
-                            # 确保有steps键且为数组
-                            if not isinstance(data.get('steps', None), list):
-                                raise ValueError("Missing or invalid 'steps' array")
-                            
-                            # 验证每个步骤的结构
-                            for step in data['steps']:
-                                if not isinstance(step, dict):
-                                    continue
-                                
-                                # 确保action和params存在
-                                if 'action' not in step:
-                                    continue
-                                
-                                # 如果没有params，添加空对象
-                                if 'params' not in step:
-                                    step['params'] = {}
-                            
-                            # 重新序列化为格式化的JSON
-                            return json.dumps(data)
-                            
-                        except json.JSONDecodeError as e:
-                            print(f"JSON验证失败: {e}")
-                            raise
-                    
-                    # 执行清理流程
-                    text = initial_clean(text)
-                    text = extract_json(text)
-                    text = fix_json_structure(text)
-                    text = fix_steps_array(text)
-                    
-                    # 打印中间结果（用于调试）
-                    print(f"清理后的JSON: {text}")
-                    
-                    # 最终验证
-                    text = validate_json(text)
-                    
-                    return text
-                    
-                except Exception as e:
-                    print(f"JSON清理失败: {e}")
-                    print(f"原始文本: {text}")
-                    raise ValueError(f"无法生成有效的JSON: {str(e)}")
+用户需求：寻找Python入门教程视频
+错误关键词：Python教程视频（❌ 不要把内容类型加入关键词）
+正确关键词：Python教程（✓ 只需要核心主题）
 
-            # 2. 清理并解析JSON
-            cleaned_response = clean_response(response)
-            print(f"清理后的JSON: {cleaned_response}")
-            data = json.loads(cleaned_response)
+用户需求：搜索美食up主视频
+错误关键词：美食视频up主（❌ 不要把多个概念混合）
+正确关键词：美食up主（✓ 只需要目标对象）
 
-            # 3. 验证JSON结构
-            if not isinstance(data, dict) or "steps" not in data:
-                raise ValueError("JSON结构不正确")
+当前需求内容：{user_query}
 
-            # 4. 解析步骤
-            steps = []
-            for step_data in data["steps"]:
-                if not isinstance(step_data, dict):
-                    continue
-                
-                action_name = step_data.get("action")
-                if not action_name:
-                    continue
-                
-                try:
-                    action = ActionType(action_name)
-                    params = step_data.get("params", {})
-                    
-                    # 确保params中的所有值都是字符串
-                    if isinstance(params, dict):
-                        params = {
-                            key: str(value) if value is not None else ""
-                            for key, value in params.items()
-                        }
-                    
-                    # 为不同的动作类型设置默认参数
-                    if action == ActionType.CLICK_RESULT:
-                        # 为 click_result 添加默认参数
-                        params["index"] = str(params.get("index", "0"))
-                        # 如果 link_text 为空，使用默认值
-                        if not params.get("link_text"):
-                            params["link_text"] = ".*"  # 使用通配符匹配任何标题
-                    
-                    # 创建对应的Step对象
-                    if action == ActionType.EXTRACT_TEXT:
-                        step = Step(action=action, params=ExtractParams(**params))
-                    elif action == ActionType.CLICK_RESULT:
-                        step = Step(action=action, params=ClickParams(**params))
-                    elif action == ActionType.SEARCH:
-                        step = Step(action=action, params=SearchParams(**params))
-                    elif action == ActionType.BACK:
-                        step = Step(action=action, params={})
-                    else:
-                        continue
-                    
-                    steps.append(step)
-                except Exception as e:
-                    print(f"步骤解析错误: {e}")
-                    continue
-
-            if not steps:
-                raise ValueError("未能解析出有效的步骤")
-            
-            return steps
-            
-        except Exception as e:
-            raise ValueError(f"任务解析失败: {str(e)}\n原始响应: {response}")
-
-class LLMClient:
-    """统一的 LLM 客户端接口"""
-    def __init__(self, base_url="http://172.31.118.255:11434", model="glm4:latest", 
-                 timeout=30, max_retries=3):
-        self.base_url = base_url.rstrip('/')
-        self.model = model.strip()
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.session = requests.Session()
+请严格按照以下格式返回关键词，不要包含序号、逗号或其他文字：
+关键词"""
         
-    def _make_request(self, endpoint, payload):
-        """带重试机制的请求"""
-        for attempt in range(self.max_retries):
-            try:
-                response = self.session.post(
-                    f"{self.base_url}{endpoint}",
-                    json=payload,
-                    timeout=self.timeout
-                )
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                if attempt == self.max_retries - 1:
-                    raise
-                print(f"请求失败，正在重试 ({attempt + 1}/{self.max_retries}): {e}")
-                time.sleep(1)
-        
-    def ChatCompletion(self):
-        return self
-        
-    def create(self, messages, **kwargs):
-        """发送请求到LLM服务"""
-        try:
-            response = self.session.post(
-                f"{self.base_url}/v1/chat/completions",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": kwargs.get('temperature', 0.7),
-                    "stream": False
-                },
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.logger.error(f"请求失败: {e}")
-            raise
+        response = self._call_llm(prompt)
+        return self._parse_keywords(response)
     
-    def _get_default_response(self):
-        """返回默认的响应格式"""
-        return {
-            'choices': [{
-                'message': {
-                    'content': json.dumps({
-                        "complete": False,
-                        "element_index": 0,
-                        "reason": "继续搜索",
-                        "need_input": True,
-                        "input_text": "百度搜索"
-                    })
-                }
-            }]
-        }
-
-def retry_on_error(max_retries=3, delay=1):
-    """重试装饰器"""
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            last_error = None
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    last_error = e
-                    print(f" {attempt + 1} 次尝试失败: {str(e)}")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-            raise last_error
-        return wrapper
-    return decorator
-
-class WorkAssistant:
-    def __init__(self, api_base: str = "http://localhost:11434", 
-                 model: str = "glm4:latest",
-                 log_level: int = logging.INFO,
-                 auto_close_browser: bool = True,
-                 headless: bool = False,
-                 search_config: Optional[SearchConfig] = None):
-        # 创建 LLMClient 实例
-        self.llm_client = LLMClient(base_url=api_base, model=model)
-        
-        # 初始化其他属性
-        self.setup_logging(log_level)
-        self.collected_info = []
-        self.current_task = None
-        self.task_parser = TaskParser()
-        self.driver = None
-        self.wait = None
-        self.auto_close_browser = auto_close_browser
-        self.headless = headless
-        self.search_config = search_config or SearchConfig()
-
-    def setup_logging(self, log_level: int) -> None:
-        """设置日志系统"""
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger(__name__)
-        
-    def setup_driver(self) -> None:
-        """设置浏器驱动"""
+    def _parse_keywords(self, llm_response: str) -> List[str]:
+        """解析LLM返回的关键词"""
         try:
-            chrome_options = webdriver.ChromeOptions()
+            # 移除可能的多余空格和换行
+            response_text = llm_response.strip()
             
-            # 基本设置
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
+            # 移除所有标点符号
+            response_text = response_text.replace(',', ' ').replace('，', ' ')
             
-            # SSL设置
-            chrome_options.add_argument('--ignore-ssl-errors=yes')
-            chrome_options.add_argument('--ignore-certificate-errors')
+            # 分割并取第一个非空词
+            keywords = [k.strip() for k in response_text.split() if k.strip()]
             
-            # 性能优化
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--disable-software-rasterizer')
-            chrome_options.add_argument('--disable-extensions')
-            chrome_options.add_argument('--disable-notifications')
-            chrome_options.add_argument('--disable-popup-blocking')
-            
-            # 无头模式特定设置
-            if self.headless:
-                chrome_options.add_argument('--headless=new')  # 使用新版无头模式
-                chrome_options.add_argument('--window-size=1920,1080')
-                chrome_options.add_argument('--start-maximized')
-                chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-                chrome_options.add_argument('--enable-javascript')
-                chrome_options.add_argument('--hide-scrollbars')
-                
-                # 添加用户代理
-                chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-                
-                # 禁用图片加载以提高速度
-                chrome_options.add_argument('--blink-settings=imagesEnabled=false')
-                
-                # 设置 DOM 大小限制
-                chrome_options.add_argument('--dom-automation')
-                chrome_options.add_argument('--remote-debugging-port=9222')
-            
-            # 创建驱动
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            
-            # 设置窗口大小和位置
-            if self.headless:
-                self.driver.set_window_size(1920, 1080)
-                self.driver.set_window_position(0, 0)
-            
-            # 设置超时和等待
-            self.driver.set_page_load_timeout(30)
-            self.driver.implicitly_wait(10)
-            self.wait = WebDriverWait(self.driver, 10)
-            
-            # 设置 JavaScript 执行超时
-            self.driver.set_script_timeout(30)
-            
-            # 初始化动作链
-            self.actions = ActionChains(self.driver)
-            
-            # 验证浏览器是否正常工作
-            self.driver.get("https://www.baidu.com")
-            if "百度一下" not in self.driver.page_source:
-                raise Exception("浏览器初始化失败：无法加载百度首页")
-            
-        except Exception as e:
-            self.logger.error(f"浏览器驱动初始化失败: {e}")
-            if self.driver:
-                self.driver.quit()
-            raise
-
-    def parse_task(self, task: str) -> List[Step]:
-        """解析用户任务"""
-        try:
-            messages = self.task_parser.get_prompt_template(task)
-            response = self.create(messages=messages)
-            content = response['choices'][0]['message']['content']
-            return self.task_parser.parse_llm_response(content)
-        except Exception as e:
-            self.logger.error(f"任务解析失败: {e}")
-            raise
-
-    def execute_step(self, step: Step) -> bool:
-        """执行单个步骤，返回是否成功"""
-        self.logger.info(f"执行步骤: {step}")
-        try:
-            if step.action == ActionType.SEARCH:
-                return self._execute_search(step.params)
-            elif step.action == ActionType.CLICK_RESULT:
-                return self._execute_click_result(step.params)
-            elif step.action == ActionType.EXTRACT_TEXT:
-                return self._execute_extract_text(step.params)
-            elif step.action == ActionType.BACK:
-                return self._execute_back()
+            # 只取第一个关键词
+            if keywords:
+                keywords = [keywords[0]]
             else:
-                self.logger.error(f"未知的动作类型: {step.action}")
-                return False
+                raise ValueError("未能从LLM响应中提取到关键词")
+                
+            return keywords
+            
         except Exception as e:
-            self.logger.error(f"步骤执行失败: {e}")
-            return False
-
-    def create(self, messages, **kwargs):
-        """代理到 LLMClient 的 create 方法"""
-        return self.llm_client.create(messages=messages, **kwargs)
-
-    def _execute_search(self, params: SearchParams) -> bool:
-        """执行搜索操作"""
+            raise Exception(f"解析关键词时发生错误: {str(e)}")
+    
+    def search_web(self, keywords: List[str]) -> List[Dict]:
+        """执行搜索并返回结果"""
         try:
-            # 确保在百度首页
-            if "www.baidu.com" not in self.driver.current_url:
-                self.driver.get("https://www.baidu.com")
-                # 等待页面加载完成
-                WebDriverWait(self.driver, 10).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
+            from playwright.sync_api import sync_playwright
+            
+            results = []
+            with sync_playwright() as p:
+                # 启动浏览器
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-gpu',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process'
+                    ]
                 )
-                time.sleep(2)
-            
-            # 基本搜索逻辑
-            search_box = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "kw"))
-            )
-            
-            # 使用 JavaScript 清除和设置搜索框的值
-            self.driver.execute_script("arguments[0].value = '';", search_box)
-            self.driver.execute_script(f"arguments[0].value = '{params.keywords}';", search_box)
-            
-            # 使用 JavaScript 点击搜索按钮
-            search_button = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "su"))
-            )
-            self.driver.execute_script("arguments[0].click();", search_button)
-            
-            # 等待搜索结果加载
-            WebDriverWait(self.driver, 10).until(
-                lambda d: len(d.find_elements(By.CSS_SELECTOR, ".result,.c-container")) > 0
-            )
-            
-            # 存储原始搜索结果页面的窗口句柄
-            search_results_handle = self.driver.current_window_handle
-            processed_urls = set()  # 用于跟踪已处理的URL
-            all_results = []
-            current_page = 1
-            results_count = 0  # 用于跟踪处理的结果数量
-
-            while current_page <= self.search_config.max_pages and results_count < self.search_config.max_results:
+                
+                # 创建新页面
+                page = browser.new_page(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                )
+                
                 try:
-                    # 确保在搜索结果页面
-                    if self.driver.current_window_handle != search_results_handle:
-                        self.driver.switch_to.window(search_results_handle)
+                    # 构建搜索URL
+                    search_query = ' '.join(keywords)
+                    search_url = f"https://www.bing.com/search?q={search_query}"
                     
-                    # 等待页面加载完成
-                    time.sleep(2)
+                    # 访问页面
+                    page.goto(search_url, wait_until='networkidle')
                     
-                    # 获取当前页面的所有结果
-                    results = WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".result,.c-container"))
-                    )
+                    # 等待搜索结果加载
+                    page.wait_for_selector('#b_results')
                     
-                    self.logger.info(f"当前页面找到 {len(results)} 个结果")
-
-                    # 处理每个搜索结果
-                    for result in results:
-                        if results_count >= self.search_config.max_results:
-                            break
+                    # 获取所有搜索结果，包括特殊内容
+                    results_data = page.evaluate('''
+                        () => {
+                            const results = [];
                             
-                        try:
-                            # 跳过广告
-                            if "广告" in result.text:
-                                continue
-
-                            # 获取链接URL
-                            link = WebDriverWait(result, 5).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href]"))
-                            )
-                            url = link.get_attribute("href")
+                            // 处理所有可能的结果容器
+                            const containers = [
+                                '#b_results > li',  // 标准结果
+                                '.b_ans',           // 答案框
+                                '.b_rich',          // 富媒体结果
+                                '.b_algo',          // 算法结果
+                                '.b_top',           // 顶部结果
+                                '.b_context'        // 上下文结果
+                            ];
                             
-                            # 跳过已处理的URL
-                            if not url or url in processed_urls:
-                                continue
-                                
-                            processed_urls.add(url)
-                            results_count += 1
-                            
-                            # 获取标题文本
-                            title = link.text or "无标题"
-                            self.logger.info(f"处理第 {results_count} 个结果: {title} ({url})")
-                            
-                            # 在新标签页中打开链接
-                            self.driver.execute_script(f'window.open("{url}", "_blank");')
-                            time.sleep(1)
-                            
-                            # 切换到新标签页
-                            self.driver.switch_to.window(self.driver.window_handles[-1])
-                            
-                            try:
-                                # 等待页面加载
-                                WebDriverWait(self.driver, 10).until(
-                                    lambda d: d.execute_script("return document.readyState") == "complete"
-                                )
-                                
-                                # 提取内容
-                                content = self.driver.find_element(By.TAG_NAME, "body").text
-                                quality_score = self.evaluate_content_quality(content, params.keywords)
-                                
-                                if quality_score >= self.search_config.quality_threshold:
-                                    all_results.append({
-                                        "url": url,
-                                        "data": content[:5000],
-                                        "quality_score": quality_score,
-                                        "title": title
-                                    })
+                            // 获取所有匹配的元素
+                            containers.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(item => {
+                                    // 跳过广告
+                                    if (item.classList.contains('b_ad')) return;
                                     
-                            finally:
-                                # 关闭当前标签页
-                                self.driver.close()
-                                # 切回搜索结果页
-                                self.driver.switch_to.window(search_results_handle)
-
-                        except Exception as e:
-                            self.logger.warning(f"处理搜索结果失败: {e}")
-                            # 确保返回搜索结果页
-                            if self.driver.current_window_handle != search_results_handle:
-                                self.driver.close()
-                                self.driver.switch_to.window(search_results_handle)
-                            continue
-
-                    # 检查是否需要翻页
-                    if current_page < self.search_config.max_pages and results_count < self.search_config.max_results:
-                        try:
-                            next_button = WebDriverWait(self.driver, 5).until(
-                                EC.presence_of_element_located((By.ID, "page-next"))
-                            )
-                            if next_button.is_displayed() and next_button.is_enabled():
-                                next_button.click()
-                                current_page += 1
-                                time.sleep(2)
-                            else:
-                                break
-                        except:
-                            break
-                    else:
-                        break
-
-                except Exception as e:
-                    self.logger.error(f"处理搜索页面失败: {e}")
-                    break
-
-            # 按质量分数排序并保存结果
-            all_results.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
-            self.collected_info.extend(all_results)
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"搜索操作失败: {e}")
-            return False
-
-    def verify_url(self, target_text: str, current_url: str) -> bool:
-        """使用LLM验证当前URL是否符合目标要求"""
-        try:
-            prompt = [
-                {
-                    "role": "system",
-                    "content": """你是一个URL验证助手。判断当前页面是否是用户想要访问的目标网站。必须严格按照以下格式输出：
-{"is_correct":true/false,"reason":"原因"}
-
-规则：
-1. 输出格式：
-- 必须是合法的JSON
-- 必须包含is_correct和reason字段
-- is_correct必须是布尔值
-- reason必须是字符串
-
-2. 验证规则：
-- 检查名否匹配
-- 检查是否是官方网站
-- 检查是否是目标网站的主域名
-- 如果不确定，返回false
-
-示例1：
-输入：目标:bilibili URL:www.bilibili.com
-输出：{"is_correct":true,"reason":"这是哔哩哔哩官方网站"}
-
-示例2：
-输入：目标:知乎 URL:www.zhihu.com
-输出：{"is_correct":true,"reason":"是知乎官方网站"}
-
-示例3：
-输入：目标:百度 URL:news.baidu.com
-输出：{"is_correct":false,"reason":"这是百度新闻子域名，不是主站"}
-
-禁止事项：
-- 不能有多余空格
-- 不能有换行
-- 不能有注释
-- 不能改变JSON结构
-- 不能添加其他字段"""
-                },
-                {
-                    "role": "user",
-                    "content": f"目标:{target_text} URL:{current_url}"
-                }
-            ]
-            
-            # 添加重试机制
-            for attempt in range(3):
-                try:
-                    response = self.create(messages=prompt)
-                    content = response['choices'][0]['message']['content'].strip()
-                    
-                    # 清理JSON字符串
-                    def clean_json(text):
-                        # 移除所有空白字符
-                        text = re.sub(r'\s+', '', text)
-                        # 移除可能的markdown代码块标记
-                        text = re.sub(r'^```.*?\n|```$', '', text)
-                        # 确保布尔值是小写的
-                        text = text.replace('True', 'true').replace('False', 'false')
-                        # 修复可能的中文引号
-                        text = text.replace('"', '"').replace('"', '"')
-                        # 修复可能的错误逗号
-                        text = re.sub(r',}', '}', text)
-                        return text
-                    
-                    content = clean_json(content)
-                    
-                    # 记录处理后的JSON
-                    self.logger.debug(f"处理后的JSON: {content}")
-                    
-                    try:
-                        result = json.loads(content)
-                    except json.JSONDecodeError as e:
-                        self.logger.error(f"JSON解析错误: {str(e)}")
-                        self.logger.error(f"问题JSON: {content}")
-                        raise
-                    
-                    return bool(result.get('is_correct', False))
-                    
-                except Exception as e:
-                    if attempt == 2:  # 最后一次尝试
-                        self.logger.error(f"URL验证失败: {e}")
-                        return False
-                    time.sleep(1)  # 等待1秒后重试
-            
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"URL验证失败: {e}")
-            return False
-
-    def should_click_result(self, target_text: str, current_title: str) -> bool:
-        """使用LLM判断是否应该点击搜索结果"""
-        try:
-            prompt = [
-                {
-                    "role": "system",
-                    "content": """你是一个搜索结果匹配专家。判断搜索结果是否符合用户需求。必须严格按照以下格式输出：
-{"should_click":true/false,"reason":"原因"}
-
-判断规则：
-1. 内容相关性：标题是否包含相关信息
-2. 来源可靠性：是否是可靠的站
-3. 信息完整性：是否包含完整信息
-
-示例1：
-目标:Python教程 标题:Python编程教程 - 免费
-输出:{"should_click":true,"reason":"标题完全符合要求，是Python教程"}
-
-示例2：
-目标:编程入门 标题:广告 - 编程培训速成
-输出:{"should_click":false,"reason":"广告内容，不可靠"}
-
-示例3：
-目标:Python文档 标题:Python官方文档中文版
-输出:{"should_click":true,"reason":"官方文档，可靠且相关"}"""
-                },
-                {
-                    "role": "user",
-                    "content": f"目标:{target_text} 标题:{current_title}"
-                }
-            ]
-            
-            response = self.create(messages=prompt)
-            content = response['choices'][0]['message']['content'].strip()
-            
-            # 清理和解析JSON
-            content = re.sub(r'\s+', '', content)
-            content = re.sub(r'```.*?\n|```', '', content)
-            result = json.loads(content)
-            
-            return bool(result.get('should_click', False))
-            
-        except Exception as e:
-            self.logger.error(f"结果配判断失败: {e}")
-            return False
-
-    def _execute_click_result(self, params: ClickParams) -> bool:
-        """执行点击搜索结果操作"""
-        try:
-            # 强制等待页面加载
-            time.sleep(3)
-            
-            # 等待搜索结果加载完成
-            results = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".result,.c-container"))
-            )
-            
-            self.logger.info(f"找到 {len(results)} 个搜索结果")
-            
-            # 过滤广告结果
-            valid_results = []
-            for result in results:
-                try:
-                    if "广告" not in result.text:
-                        valid_results.append(result)
-                except:
-                    continue
-            
-            if not valid_results:
-                self.logger.warning("未找到有效的搜索结果")
-                return False
-            
-            # 获取目标结果
-            index = min(int(params.index), len(valid_results) - 1)
-            target_result = valid_results[index]
-            
-            # 滚动到元素位置
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", target_result)
-            time.sleep(1)
-            
-            # 获取链接元素
-            link = WebDriverWait(target_result, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href]"))
-            )
-            
-            # 获取链接URL
-            url = link.get_attribute("href")
-            if not url:
-                return False
-            
-            # 在新标签页中打开链接
-            self.driver.execute_script(f'window.open("{url}", "_blank");')
-            time.sleep(2)
-            
-            # 切换到新标签页
-            self.driver.switch_to.window(self.driver.window_handles[-1])
-            
-            # 等待新页面加载
-            WebDriverWait(self.driver, 10).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"点击搜索结果失败: {e}")
-            return False
-
-    def _execute_extract_text(self, params: ExtractParams) -> bool:
-        """执行提取文本操作"""
-        try:
-            # 等待页面加载
-            time.sleep(2)
-            
-            # 常用选择器列表
-            selectors = [
-                params.selector,
-                "article",
-                ".article",
-                ".content",
-                "#content",
-                "main",
-                ".main-content",
-                ".post-content",
-                ".entry-content",
-                ".text",
-                "p",
-                "body"
-            ]
-            
-            # 尝试每个选择器
-            for selector in selectors:
-                try:
-                    elements = WebDriverWait(self.driver, 5).until(
-                        EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
-                    )
-                    
-                    if elements:
-                        texts = []
-                        for element in elements:
-                            try:
-                                text = element.text if params.attribute == "text" else element.get_attribute(params.attribute)
-                                if text and text.strip():
-                                    texts.append(text.strip())
-                            except:
-                                continue
-                        
-                        if texts:
-                            self.collected_info.append({
-                                "type": "text",
-                                "data": "\n".join(texts)[:5000],
-                                "url": self.driver.current_url,
-                                "timestamp": datetime.now().isoformat()
-                            })
-                            return True
+                                    let title = '';
+                                    let url = '';
+                                    let description = '';
+                                    let content = '';
+                                    
+                                    // 获取所有文本内容（用于特殊结果）
+                                    content = item.textContent.trim();
+                                    
+                                    // 获取链接和标题
+                                    const links = item.querySelectorAll('a[href]:not([href^="javascript:"]):not([href^="#"])');
+                                    for (const link of links) {
+                                        const text = link.textContent.trim();
+                                        if (text && link.href) {
+                                            title = text;
+                                            url = link.href;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // 获取描述
+                                    const descElements = item.querySelectorAll('p, .b_caption p, .b_snippet, .snippet, .news-body');
+                                    for (const desc of descElements) {
+                                        const text = desc.textContent.trim();
+                                        if (text) {
+                                            description = text;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // 添加结果
+                                    if ((title && url) || content) {
+                                        results.push({
+                                            title,
+                                            url,
+                                            description,
+                                            content,
+                                            isSpecialContent: !title && !url && content
+                                        });
+                                    }
+                                });
+                            });
                             
-                except Exception as e:
-                    self.logger.debug(f"使用选择器 {selector} 提取失败: {e}")
-                    continue
-            
-            self.logger.warning("未能找到有效文本")
-            return False
-            
+                            return results;
+                        }
+                    ''')
+                    
+                    # 处理结果
+                    for result in results_data:
+                        if result.get('isSpecialContent'):
+                            # 特殊内容（如热搜列表）直接使用content
+                            results.append({
+                                'title': '特殊内容',
+                                'url': search_url,
+                                'description': result['content']
+                            })
+                        else:
+                            # 标准搜索结果
+                            results.append({
+                                'title': result['title'],
+                                'url': result['url'],
+                                'description': result['description']
+                            })
+                        print(f"Found result: {result}")  # 调试输出
+                    
+                    print(f"Total results found: {len(results)}")  # 调试输出
+                    return results
+                    
+                finally:
+                    browser.close()
+                    
         except Exception as e:
-            self.logger.error(f"提取文本失败: {e}")
-            return False
-
-    def _execute_back(self) -> bool:
-        """执行返回上一页操作"""
+            print(f"Search error: {str(e)}")  # 调试输出
+            raise Exception(f"搜索网页时发生错误: {str(e)}")
+    
+    def select_pages(self, search_results: List[Dict], user_query: str) -> List[str]:
+        """让LLM选择最相关的页面"""
         try:
-            self.driver.back()
-            return True
-        except Exception as e:
-            self.logger.error(f"返回上一页失败: {e}")
-            return False
+            prompt = f"""基于用户需求，从搜索结果中选择1个最相关的页面标题。
 
-    @retry_on_error(max_retries=3)
-    def plan_task(self, user_task: str) -> str:
-        """让模型规划任务步骤"""
-        prompt = [
-            {
-                "role": "system",
-                "content": """你是一个任务规划手。必须严格按照以下规则输出：
-
-1. 输出格式必须是：
-让我帮你规划任务
-1. 搜索"关键词"
-2. 进入[网站名]
-3. 提取[体内容]
-4. 返回搜索页（如果有多个网站）
-5. 重复上述步骤（如果有多个网站）
-
-2. 严格规则：
-- 搜索词必须简短精确（2-4个词）
-- 每个网站单独处理
-- 必须顺序执行
-- 禁止添加任何说明文字
-
-3. 示例1：
-输入：收集bilibili和优酷的首页视频标题
-输出：
-让我帮你规划任务：
-1. 搜索"哔哩哔哩 bilibili"
-2. 进入B站官网
-3. 提取首页视频标题
-4. 返回搜索页
-5. 搜索"优酷视频官网"
-6. 进入优酷官网
-7. 提取首页视频标题
+示例1：
+用户需求：搜索哔哩哔哩，收集视频标题
+搜索结果：
+[{{"title": "哔哩哔哩 (゜-゜)つロ 干杯~-bilibili", "url": "https://www.bilibili.com"}}, {{"title": "B站_百度百科", "url": "https://baike.baidu.com/item/B站"}}]
+选择标题：哔哩哔哩 (゜-゜)つロ 干杯~-bilibili
 
 示例2：
-输入：查找知乎和百度知道上关于Python的热门问题
-输出：
-让我帮你规划任务：
-1. 搜索"知乎"
-2. 进入知乎官网
-3. 提取Python相关热门问题
-4. 返回搜索页
-5. 搜索"百度知道"
-6. 进入百度知道
-7. 提取Python相关热门问题
+用户需求：查找Python教程
+搜索结果：
+[{{"title": "Python教程 - 廖雪峰的官方网站", "url": "https://www.liaoxuefeng.com/wiki/1016959663602400"}}, {{"title": "Python入门教程", "url": "https://www.runoob.com/python/python-tutorial.html"}}]
+选择标题：Python教程 - 廖雪峰的官方网站
 
 示例3：
-输入：获取淘宝和京东的iPhone15价格
-输出：
-让我帮你规划任务：
-1. 搜索"淘宝网"
-2. 进入淘宝官网
-3. 提取iPhone15价格信息
-4. 返回搜索页
-5. 搜索"京东商城"
-6. 进入京东官网
-7. 提取iPhone15价格信息
+用户需求：寻找北京火锅推荐
+搜索结果：
+[{{"title": "北京最受欢迎的10家火锅店", "url": "https://example.com/1"}}, {{"title": "美团外卖北京火锅", "url": "https://example.com/2"}}]
+选择标题：北京最受欢迎的10家火锅店
 
-4. 禁止事项：
-- 不能包含额外解释
-- 不能有多余的标点
-- 不能改变步骤格式
-- 不能省略任何步骤"""
-            },
-            {
-                "role": "user",
-                "content": user_task
-            }
-        ]
-        try:
-            response = self.create(messages=prompt)
-            planned_task = response['choices'][0]['message']['content']
-            return planned_task
-        except Exception as e:
-            self.logger.error(f"任务规划失败: {e}")
-            raise
+注意事项：
+1. 如果用户需求是搜索视频网站，优先选择该网站的主页而不是教程或介绍页面
+2. 如果用户需求是寻找教程，优先选择专业的教程网站而不是问答页面
+3. 如果用户需求是寻找推荐，优先选择包含排名或列表的页面
 
-    def execute_task(self, task: str) -> str:
-        """执行完整任务流程并返回整理后的内容"""
-        try:
-            # 先进行任务规划
-            planned_task = self.plan_task(task)
-            self.logger.info(f"任务规划结果: {planned_task}")
+当前用户需求: {user_query}
+当前搜索结果:
+{json.dumps(search_results, ensure_ascii=False, indent=2)}
+
+请严格按照以下格式返回标题，不要添加任何其他文字：
+标题"""
             
-            # 在执行任务前初始化浏览器
-            self.setup_driver()
-            self.driver.get("https://www.baidu.com")
+            print(f"Prompt to LLM:\n{prompt}")  # 调试输出
             
-            # 解析任务
-            steps = self.parse_task(planned_task)
-            self.current_task = TaskPlan(
-                steps=steps,
-                task_id=str(time.time()),
-                created_at=time.time()
-            )
+            # 调用LLM
+            response = self._call_llm(prompt)
+            print(f"LLM Response:\n{response}")  # 调试输出
             
-            # 执行每个步骤
-            for step in steps:
-                success = self.execute_step(step)
-                if not success:
-                    self.logger.error(f"步骤执行失败: {step}")
-                    break
+            # 解析返回的标题
+            titles = [title.strip() for title in response.strip().split(',')]
+            print(f"Found titles: {titles}")  # 调试输出
             
-            # 如果收集到信息则进行整理
-            if self.collected_info:
-                result = self.format_collected_info(self.collected_info, task)
-            else:
-                result = "未能集到任何信息"
+            # 根据标题查找对应的URL
+            urls = []
+            for title in titles:
+                for result in search_results:
+                    if title in result['title'] or result['title'] in title:
+                        urls.append(result['url'])
+                        print(f"Matched title '{title}' to URL: {result['url']}")  # 调试输出
+                        break
             
-            # 根据设置决定是否关闭浏览器
-            if self.auto_close_browser:
-                self.close()
-                
-            return result
+            if not urls and search_results:
+                # 如果没有匹配的URL，使用第一个搜索结果
+                urls = [search_results[0]['url']]
+                print(f"Falling back to first result: {urls[0]}")  # 调试输出
+            
+            return urls
             
         except Exception as e:
-            self.logger.error(f"任务执行失败: {e}")
-            # 发生错误时也根据设置决定是否关闭浏览器
-            if self.auto_close_browser:
-                self.close()
-            raise
-
-    def close(self) -> None:
-        """清理资源"""
-        if hasattr(self, 'driver') and self.driver is not None:
-            try:
-                self.driver.quit()
-            except Exception as e:
-                self.logger.error(f"关闭浏览器失败: {e}")
-            finally:
-                self.driver = None
-                self.wait = None
-
-    def validate(self) -> bool:
-        """验证步骤参数是否合法"""
+            print(f"Error in select_pages: {str(e)}")  # 调试输出
+            raise Exception(f"选择页面时发生错误: {str(e)}")
+    
+    def crawl_page_content(self, url: str) -> Dict:
+        """使用DOM树分析页面内容"""
         try:
-            if self.action == ActionType.SEARCH:
-                assert isinstance(self.params, SearchParams)
-                assert len(self.params.keywords.strip()) > 0
-            elif self.action == ActionType.CLICK_RESULT:
-                assert isinstance(self.params, ClickParams)
-                assert self.params.index >= 0
-                assert len(self.params.link_text.strip()) > 0
-            elif self.action == ActionType.EXTRACT_TEXT:
-                assert isinstance(self.params, ExtractParams)
-                assert len(self.params.selector.strip()) > 0
-            return True
-        except AssertionError:
-            return False
-
-    def to_dict(self) -> Dict[str, Any]:
-        """换为字典格式"""
-        return {
-            "action": self.action.value,
-            "params": asdict(self.params)
-        }
-
-    @retry_on_error(max_retries=3)
-    def format_collected_info(self, info_list: List[Dict[str, Any]], user_task: str) -> str:
-        """格式化收集的信息"""
-        try:
-            if not info_list:
-                return "未收集到任何信息"
-
-            # 预处理收集到的信息
-            formatted_info = []
-            urls = set()  # 用于去重
+            from playwright.sync_api import sync_playwright
             
-            for info in info_list:
-                if isinstance(info.get('data'), str):
-                    text = info['data'][:1000]  # 限制单条信息长度
-                    url = info.get('url', '')
-                    timestamp = info.get('timestamp', '')
-                    
-                    if url not in urls:  # 避免重复URL
-                        urls.add(url)
-                        formatted_info.append({
-                            "text": text,
-                            "url": url,
-                            "timestamp": timestamp
-                        })
-
-            if not formatted_info:
-                return "收集到的信息无法处理"
-
-            # 构建输出
-            output = "【主要内容】\n"
-            for idx, info in enumerate(formatted_info, 1):
-                # 提取日期（如果有）
-                date_str = ""
-                if info['timestamp']:
-                    try:
-                        date = datetime.fromisoformat(info['timestamp'])
-                        date_str = f"[{date.strftime('%Y-%m-%d')}] "
-                    except:
-                        pass
-                        
-                output += f"{idx}. {date_str}{info['text'][:200]}...\n\n"
-
-            output += "\n【相关链接】\n"
-            for idx, info in enumerate(formatted_info, 1):
-                if info['url']:
-                    output += f"{idx}. {info['url']}\n"
-
-            return output
-
-        except Exception as e:
-            self.logger.error(f"格式化信息失败: {e}")
-            return f"格式化失败。原因：{str(e)}\n收集到 {len(info_list)} 条信息。"
-
-    def evaluate_content_quality(self, content: str, user_task: str) -> float:
-        """评估内容质量和相关性"""
-        try:
-            prompt = [
-                {
-                    "role": "system",
-                    "content": """评估内容质量和相关性。必须输出0到1之间的分数：
-{"score":0.85,"reason":"原因"}
-
-评分标准：
-1. 相关性(40%): 与用户需求的相关程度
-2. 可信度(30%): 内容的可信度和权威性
-3. 完整性(20%): 信息的完整性
-4. 时效性(10%): 信息的新旧程度
-
-示例输出：
-{"score":0.85,"reason":"内容高度相关且可信"}"""
-                },
-                {
-                    "role": "user",
-                    "content": f"用户需求：{user_task}\n内容：{content[:500]}"  # 限制内容长度
-                }
-            ]
-            
-            response = self.create(messages=prompt)
-            content = response['choices'][0]['message']['content'].strip()
-            
-            # 清理和验证 JSON
-            try:
-                # 移除可能的非 JSON 内容
-                content = re.search(r'\{.*\}', content).group(0)
-                result = json.loads(content)
-                return float(result.get('score', 0.0))
-            except (AttributeError, json.JSONDecodeError):
-                return 0.0
-            
-        except Exception as e:
-            self.logger.error(f"内容质量评估失败: {e}")
-            return 0.0
-
-    def deep_search(self, initial_url: str, user_task: str, depth: int = 0) -> List[Dict[str, Any]]:
-        """深度搜索页面内容"""
-        if depth >= self.search_config.max_depth:
-            return []
-
-        collected_data = []
-        try:
-            # 存储原始窗口句柄
-            original_window = self.driver.current_window_handle
-            
-            # 在新标签页中打开链接
-            self.driver.execute_script(f'window.open("{initial_url}", "_blank");')
-            time.sleep(2)
-            
-            # 切换到新标签页
-            self.driver.switch_to.window(self.driver.window_handles[-1])
-            
-            try:
-                # 等待页面加载完成
-                WebDriverWait(self.driver, 10).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-gpu',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-web-security'
+                    ]
                 )
                 
-                # 提取当前页面内容
-                content = self.driver.find_element(By.TAG_NAME, "body").text
-                quality_score = self.evaluate_content_quality(content, user_task)
-
-                if quality_score >= self.search_config.quality_threshold:
-                    collected_data.append({
-                        "url": initial_url,
-                        "data": content,
-                        "quality_score": quality_score
-                    })
-
-                # 如果深度允许，获取子链接
-                if depth < self.search_config.max_depth:
-                    # 获取所有链接
-                    links = []
-                    try:
-                        # 使用JavaScript获取所有链接
-                        links_data = self.driver.execute_script("""
-                            var links = [];
-                            var elements = document.getElementsByTagName('a');
-                            for(var i = 0; i < elements.length; i++) {
-                                var href = elements[i].href;
-                                var text = elements[i].innerText;
-                                if(href && href.startsWith('http')) {
-                                    links.push({href: href, text: text});
-                                }
-                            }
-                            return links;
-                        """)
-                        
-                        # 过滤和处理链接
-                        for link_data in links_data:
-                            url = link_data['href']
-                            text = link_data['text']
-                            
-                            # 跳过社交媒体、广告等链接
-                            if any(skip in url.lower() for skip in ['twitter', 'facebook', 'ads', 'login', 'signup']):
-                                continue
-                            
-                            links.append(url)
-                            
-                    except Exception as e:
-                        self.logger.warning(f"获取子链接失败: {e}")
-
-                    # 处理子链接
-                    for sub_url in links[:self.search_config.max_results]:
-                        try:
-                            sub_results = self.deep_search(sub_url, user_task, depth + 1)
-                            collected_data.extend(sub_results)
-                        except Exception as e:
-                            self.logger.warning(f"处理子链接失败: {e}")
-                            continue
-
-            finally:
-                # 关闭当前标签页
-                self.driver.close()
-                # 切回原始窗口
-                self.driver.switch_to.window(original_window)
-
-            return collected_data
-
+                page = browser.new_page(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                )
+                
+                try:
+                    page.goto(url, wait_until='networkidle')
+                    
+                    # 获取DOM树结构
+                    dom_tree = self._build_dom_tree(page)
+                    
+                    # 提取有意义的内容
+                    content = self._extract_content_from_dom(dom_tree)
+                    
+                    return {'content': content, 'url': url}
+                    
+                finally:
+                    browser.close()
+                    
         except Exception as e:
-            self.logger.error(f"深度搜索失败: {e}")
-            # 确保切回原始窗口
-            try:
-                self.driver.switch_to.window(original_window)
-            except:
-                pass
-            return []
+            print(f"页面分析失败: {url}, 错误: {str(e)}")
+            return {'content': '', 'url': url}
 
-    def get_summary_prompt(self, info_list: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        """获取总结提示词"""
-        # 准备输入文本
-        texts = []
-        for info in info_list:
-            if isinstance(info.get('data'), str):
-                text = info['data'][:1000]  # 限制单条信息长度
-                url = info.get('url', '')
-                texts.append(f"来源: {url}\n内容: {text}\n")
-        
-        combined_text = "\n".join(texts)
-        
-        return [
-            {
-                "role": "system",
-                "content": """你是一个专业的信息总结专家。请严格按照以下格式和规则总结提供的信息：
-
-输出格式：
-{
-    "summary": {
-        "main_points": [
-            "要点1",
-            "要点2",
-            "要点3"
-        ],
-        "details": {
-            "time_info": "时间相关信息",
-            "key_facts": [
-                "关键事实1",
-                "关键事实2"
-            ],
-            "statistics": [
-                "统计数据1",
-                "统计数据2"
-            ]
-        },
-        "conclusion": "总结性结论"
-    }
-}
-
-严格规则：
-1. 格式要求：
-- 必须输出合法的JSON格式
-- 必须包含所有指定字段
-- 不允许添加额外字段
-- 不能使用markdown格式
-- 不能包含HTML标签
-
-2. 内容要求：
-- main_points: 3-5个核心要点
-- key_facts: 2-4个关键事实
-- statistics: 包含数字的统计信息（如果有）
-- conclusion: 50-100字的总结
-
-3. 写作规范：
-- 使用中文输出
-- 使用客观陈述语气
-- 避免主观评价
-- 保持时间信息的准确性
-- 数据必须有来源说明
-
-4. 禁止事项：
-- 不能使用模糊表述
-- 不能添加个人观点
-- 不能使用营销语言
-- 不能包含预测性内容
-- 不能使用未经证实的信息
-
-5. 信息处理：
-- 合并重复信息
-- 优先使用最新信息
-- 保留具体数据
-- 注明信息来源
-- 标注时间戳
-
-错误示例：
-{
-    "summary": {
-        "main_points": ["可能会发展", "据说有影响", "预计将会"],
-        "details": {
-            "time_info": "最近",
-            "key_facts": ["某些专家认为"],
-            "statistics": ["大约有很多"]
-        },
-        "conclusion": "前景光明"
-    }
-}
-
-注意：如果信息不足，相应字段填写"信息不足"，但必须保持JSON结构完整。"""
-            },
-            {
-                "role": "user",
-                "content": f"请总结以下信息：\n\n{combined_text}"
+    def _build_dom_tree(self, page) -> Dict:
+        """构建DOM树结构"""
+        return page.evaluate('''
+            () => {
+                function buildNode(element) {
+                    const node = {
+                        tagName: element.tagName?.toLowerCase(),
+                        type: element.nodeType === 3 ? 'TEXT_NODE' : 'ELEMENT_NODE',
+                        isVisible: (function() {
+                            if (element.nodeType === 3) {
+                                return element.textContent.trim().length > 0;
+                            }
+                            const style = window.getComputedStyle(element);
+                            return style.display !== 'none' && 
+                                   style.visibility !== 'hidden' && 
+                                   style.opacity !== '0';
+                        })(),
+                        isInteractive: (function() {
+                            if (element.nodeType === 3) return false;
+                            const interactiveTags = ['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'];
+                            return interactiveTags.includes(element.tagName) || 
+                                   element.onclick != null || 
+                                   element.getAttribute('role') === 'button';
+                        })(),
+                        children: []
+                    };
+                    
+                    if (element.nodeType === 3) {
+                        node.text = element.textContent.trim();
+                    } else {
+                        // 获取元素属性
+                        node.attributes = {};
+                        for (const attr of element.attributes || []) {
+                            node.attributes[attr.name] = attr.value;
+                        }
+                        
+                        // 递归处理子节点
+                        for (const child of element.childNodes) {
+                            if (child.nodeType === 1 || (child.nodeType === 3 && child.textContent.trim())) {
+                                node.children.push(buildNode(child));
+                            }
+                        }
+                    }
+                    
+                    return node;
+                }
+                
+                return buildNode(document.documentElement);
             }
-        ]
+        ''')
 
-# 用示例
-def main():
-    assistant = WorkAssistant(log_level=logging.DEBUG)  # 设置更详细的日志级别
+    def _extract_content_from_dom(self, dom_tree: Dict) -> str:
+        """从DOM树中提取有意义的内容"""
+        content_parts = []
+        
+        def extract_node(node: Dict):
+            if node['type'] == 'TEXT_NODE' and node['isVisible']:
+                text = node.get('text', '').strip()
+                if text and len(text) > 3:  # 忽略太短的文本
+                    content_parts.append(text)
+            
+            if node['type'] == 'ELEMENT_NODE':
+                # 处理特定标签
+                tag = node.get('tagName', '')
+                if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                    # 为标题添加标记
+                    heading_texts = [child.get('text', '') for child in node['children'] 
+                                   if child['type'] == 'TEXT_NODE' and child['isVisible']]
+                    if heading_texts:
+                        content_parts.append(f"\n[{tag.upper()}] {''.join(heading_texts)}\n")
+                
+                # 递归处理子节点
+                for child in node.get('children', []):
+                    extract_node(child)
+        
+        extract_node(dom_tree)
+        return '\n'.join(content_parts)
     
-    try:
-        task = "搜索哔哩哔"
-        result = assistant.execute_task(task)
-        print("执行结果:", result)
-    except Exception as e:
-        print(f"执行失败: {e}")
-    finally:
-        assistant.close()
+    def summarize_content(self, content: str, user_query: str) -> str:
+        """基于爬取的内容回答用户需求"""
+        try:
+            # 检查内容是否为空或无效
+            if not content or len(content.strip()) < 10:
+                return "抱歉，未能成功获取到有效内容。可能的原因：\n1. 页面需要登录\n2. 内容被动态加载\n3. 网站有反爬虫机制\n\n建议：\n- 尝试直接访问网页\n- 选择其他相关网页"
+
+            prompt = f"""你现在拥有以下知识：
+
+{content}
+
+请基于上述知识，回答用户的需求：{user_query}
+
+要求：
+1. 只使用给定知识中的信息来回答
+2. 如果知识中没有相关信息，请明确说明
+3. 保持回答的准确性和客观性
+4. 使用清晰的结构组织回答
+5. 如果信息不完整，可以指出缺失的部分
+
+请直接给出回答，不要解释你的思考过程。"""
+
+            return self._call_llm(prompt)
+            
+        except Exception as e:
+            return f"处理内容时发生错误: {str(e)}"
+    
+    def start_search(self):
+        query = self.query_input.toPlainText()
+        if not query:
+            return
+            
+        try:
+            # 清空之前的结果
+            self.results_display.clear()
+            
+            self.status_display.append("分析需求中...")
+            keywords = self.browser.analyze_query(query)
+            self.results_display.append("搜索关键词：" + ", ".join(keywords) + "\n")
+            
+            self.status_display.append("搜索相关内容...")
+            search_results = self.browser.search_web(keywords)
+            
+            self.status_display.append("选择相关页面...")
+            selected_urls = self.browser.select_pages(search_results, query)
+            
+            # 爬取选中页面的内容
+            self.status_display.append("爬取页面内容...")
+            all_content = []
+            for url in selected_urls:
+                content = self.browser.crawl_page_content(url)
+                # 清理内容（移除多余空白字符）
+                cleaned_content = ' '.join(content['content'].split())
+                all_content.append(cleaned_content)
+            
+            # 合并所有内容
+            combined_content = '\n\n'.join(all_content)
+            
+            # 让LLM总结内容
+            self.status_display.append("正在总结内容...")
+            summary = self.browser.summarize_content(combined_content, query)
+            
+            # 显示总结结果
+            self.results_display.append("\n总结内容：\n")
+            self.results_display.append(summary)
+            
+            self.status_display.append("处理完成!")
+            if selected_urls:
+                self.web_view.setUrl(QUrl(selected_urls[0]))
+        except Exception as e:
+            self.status_display.append(f"错误: {str(e)}")
+
+class SearchThread(QThread):
+    """搜索线程"""
+    # 定义信号
+    status_signal = pyqtSignal(str)  # 用于更新状态
+    result_signal = pyqtSignal(str)  # 用于更新结果
+    error_signal = pyqtSignal(str)   # 用于报告错误
+    url_signal = pyqtSignal(str)     # 用于更新网页
+    search_url_signal = pyqtSignal(str)  # 用于更新搜索页面
+    progress_signal = pyqtSignal(int)  # 用于更新进度条
+
+    def __init__(self, browser, query):
+        super().__init__()
+        self.browser = browser
+        self.query = query
+
+    def run(self):
+        try:
+            # 分析需求 (20%)
+            self.progress_signal.emit(0)
+            self.status_signal.emit("分析需求中...")
+            keywords = self.browser.analyze_query(self.query)
+            self.result_signal.emit("搜索关键词：" + ", ".join(keywords) + "\n")
+            self.progress_signal.emit(20)
+            
+            # 搜索内容 (40%)
+            self.status_signal.emit("搜索相关内容...")
+            search_query = ' '.join(keywords)
+            search_url = f"https://www.bing.com/search?q={search_query}"
+            self.search_url_signal.emit(search_url)
+            search_results = self.browser.search_web(keywords)
+            self.progress_signal.emit(40)
+            
+            # 选择页面 (60%)
+            self.status_signal.emit("选择相关页面...")
+            selected_urls = self.browser.select_pages(search_results, self.query)
+            if selected_urls:
+                self.url_signal.emit(selected_urls[0])
+            self.progress_signal.emit(60)
+            
+            # 爬取内容 (80%)
+            self.status_signal.emit("爬取页面内容...")
+            all_content = []
+            for url in selected_urls:
+                content = self.browser.crawl_page_content(url)
+                cleaned_content = ' '.join(content['content'].split())
+                all_content.append(cleaned_content)
+            self.progress_signal.emit(80)
+            
+            # 总结内容 (100%)
+            self.status_signal.emit("正在总结内容...")
+            combined_content = '\n\n'.join(all_content)
+            summary = self.browser.summarize_content(combined_content, self.query)
+            self.result_signal.emit("\n总结内容：\n" + summary)
+            self.progress_signal.emit(100)
+            
+            self.status_signal.emit("处理完成!")
+                
+        except Exception as e:
+            self.error_signal.emit(f"错误: {str(e)}")
+            self.progress_signal.emit(0)
+
+class BatchTaskDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量任务设置")
+        self.setMinimumSize(600, 400)
+        self.tasks = []  # 存储任务列表
+        self.setupUI()
+        
+    def setupUI(self):
+        layout = QVBoxLayout(self)
+        
+        # 创建表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["需求内容", "计划执行时间", "状态"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 100)
+        layout.addWidget(self.table)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        
+        # 添加任务按钮
+        add_button = QPushButton("添加任务")
+        add_button.clicked.connect(self.add_task)
+        button_layout.addWidget(add_button)
+        
+        # 删除任务按钮
+        delete_button = QPushButton("删除任务")
+        delete_button.clicked.connect(self.delete_task)
+        button_layout.addWidget(delete_button)
+        
+        # 确认按钮
+        confirm_button = QPushButton("确认")
+        confirm_button.clicked.connect(self.accept)
+        button_layout.addWidget(confirm_button)
+        
+        # 取消按钮
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        
+    def add_task(self):
+        """添加新任务行"""
+        current_row = self.table.rowCount()
+        self.table.insertRow(current_row)
+        
+        # 需求内容
+        content_item = QTableWidgetItem("")
+        self.table.setItem(current_row, 0, content_item)
+        
+        # 时间选择
+        time_widget = QTimeEdit()
+        time_widget.setDisplayFormat("HH:mm:ss")
+        if current_row == 0:
+            # 第一个任务默认即时开始
+            time_widget.setTime(QTime.currentTime())
+        else:
+            # 后续任务默认在上一个任务的1小时后
+            last_time = self.table.cellWidget(current_row-1, 1).time()
+            next_time = last_time.addSecs(3600)  # 添加1小时
+            time_widget.setTime(next_time)
+        self.table.setCellWidget(current_row, 1, time_widget)
+        
+        # 状态
+        status_item = QTableWidgetItem("等待中")
+        self.table.setItem(current_row, 2, status_item)
+        
+    def delete_task(self):
+        """删除选中的任务行"""
+        current_row = self.table.currentRow()
+        if current_row >= 0:
+            self.table.removeRow(current_row)
+            
+    def get_tasks(self):
+        """获取所有任务信息"""
+        tasks = []
+        for row in range(self.table.rowCount()):
+            content = self.table.item(row, 0).text()
+            time = self.table.cellWidget(row, 1).time()
+            tasks.append({
+                'content': content,
+                'time': time,
+                'status': self.table.item(row, 2).text()
+            })
+        return tasks
+
+class HistoryDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("搜索历史")
+        self.setMinimumSize(800, 600)
+        self.setupUI()
+        
+    def setupUI(self):
+        layout = QVBoxLayout(self)
+        
+        # 历史记录显示区域
+        self.history_display = QTextEdit()
+        self.history_display.setReadOnly(True)
+        self.history_display.setStyleSheet("""
+            QTextEdit {
+                background-color: #ffffff;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 10px;
+                font-size: 12px;
+            }
+        """)
+        layout.addWidget(self.history_display)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        
+        # 清空历史按钮
+        clear_button = QPushButton("清空历史")
+        clear_button.clicked.connect(self.clear_history)
+        clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                border: none;
+                padding: 5px 15px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        button_layout.addWidget(clear_button)
+        
+        # 关闭按钮
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        button_layout.addWidget(close_button)
+        
+        layout.addLayout(button_layout)
+        
+    def clear_history(self):
+        reply = QMessageBox.question(
+            self, 
+            '确认清空', 
+            '确定要清空所有历史记录吗？此操作不可撤销。',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.history_display.clear()
+            # 发送信号通知主窗口历史已清空
+            self.parent().history_records.clear()
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("灵析AI浏览器")
+        self.setMinimumSize(1200, 800)
+        
+        # 创建主分割器
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(main_splitter)
+        
+        # 左侧面板
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # 输入框
+        self.query_input = QTextEdit()
+        self.query_input.setPlaceholderText("输入你的需求...")
+        self.query_input.setMaximumHeight(100)
+        left_layout.addWidget(self.query_input)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        
+        # 搜索按钮
+        search_button = QPushButton("开始搜索")
+        search_button.clicked.connect(self.start_search)
+        button_layout.addWidget(search_button)
+        
+        # 批量任务按钮
+        batch_button = self.add_batch_tasks_button()
+        button_layout.addWidget(batch_button)
+        
+        # 历史记录按钮
+        history_button = QPushButton("历史记录")
+        history_button.clicked.connect(self.show_history)
+        button_layout.addWidget(history_button)
+        
+        left_layout.addLayout(button_layout)
+        
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumHeight(2)  # 设置进度条高度
+        self.progress_bar.setTextVisible(False)  # 隐藏进度文本
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                background: #f0f0f0;
+            }
+            QProgressBar::chunk {
+                background: #4CAF50;
+            }
+        """)
+        left_layout.addWidget(self.progress_bar)
+        
+        # 状态显示
+        self.status_display = QTextEdit()
+        self.status_display.setReadOnly(True)
+        self.status_display.setPlaceholderText("状态信息...")
+        self.status_display.setMaximumHeight(50)  # 减小高度只显示最新状态
+        self.status_display.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;  /* 深色背景 */
+                border: 1px solid #333333;  /* 深色边框 */
+                border-radius: 4px;
+                padding: 5px;
+                color: #ffffff;  /* 白色文字 */
+                font-size: 12px;
+            }
+            QTextEdit:disabled {
+                background-color: #1e1e1e;
+                color: #ffffff;
+            }
+        """)
+        left_layout.addWidget(self.status_display)
+        
+        # 搜索结果显示
+        self.results_display = QTextEdit()
+        self.results_display.setReadOnly(True)
+        self.results_display.setPlaceholderText("搜索结果将在这里显示...")
+        left_layout.addWidget(self.results_display)
+        
+        # 配置WebEngine设置
+        profile = QWebEngineProfile.defaultProfile()
+        settings = profile.settings()
+        
+        # 禁用JavaScript错误报告
+        settings.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, False)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+        
+        # 其他设置保持不变
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, False)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebRTCPublicInterfacesOnly, True)
+        
+        # 禁用其他可能的问题源
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
+        profile.setPersistentStoragePath("")
+        
+        # 右侧浏览器
+        self.web_view = QWebEngineView()
+        self.default_url = QUrl("https://www.bing.com")
+        self.web_view.setUrl(self.default_url)
+        self.web_view.setZoomFactor(0.9)
+        self.web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # 将左侧面板和浏览器添加到分割器
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(self.web_view)
+        
+        # 设置初始分割比例（左:右 = 1:2）
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 2)
+        
+        # 设置分割器样式
+        main_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #cccccc;
+                width: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #999999;
+            }
+            QSplitter::handle:pressed {
+                background-color: #666666;
+            }
+        """)
+        
+        # 初始化浏览器为None
+        self.browser = None
+        self.search_thread = None
+        
+        # 添加任务存储
+        self.scheduled_tasks = []  # 存储已计划的任务
+        
+        # 存储历史记录
+        self.history_records = []
+        
+        # 初始化浏览器
+        try:
+            self.status_display.append("正在初始化浏览器...")
+            self.browser = LLMBrowser(model="glm4:latest")
+            self.status_display.append("浏览器初始化完成!")
+        except Exception as e:
+            self.status_display.append(f"初始化错误: {str(e)}")
+
+    def resizeEvent(self, event):
+        """处理窗口大小改变事件"""
+        super().resizeEvent(event)
+        # 更新web_view的大小
+        if hasattr(self, 'web_view'):
+            self.web_view.setFixedHeight(self.height())
+
+    def start_search(self):
+        query = self.query_input.toPlainText()
+        if not query:
+            return
+            
+        # 重置进度条和结果显示
+        self.progress_bar.setValue(0)
+        self.results_display.clear()
+        
+        # 创建并启动搜索线程
+        self.search_thread = SearchThread(self.browser, query)
+        
+        # 连接信号
+        self.search_thread.status_signal.connect(self.append_status)
+        self.search_thread.result_signal.connect(self.results_display.append)
+        self.search_thread.error_signal.connect(self.status_display.append)
+        self.search_thread.url_signal.connect(lambda url: self.web_view.setUrl(QUrl(url)))
+        self.search_thread.search_url_signal.connect(lambda url: self.web_view.setUrl(QUrl(url)))
+        self.search_thread.progress_signal.connect(self.progress_bar.setValue)
+        self.search_thread.finished.connect(self.on_search_finished)
+        
+        # 启动线程
+        self.search_thread.start()
+    
+    def on_search_finished(self):
+        """搜索完成后的处理"""
+        # 获取当前搜索结果
+        current_result = self.results_display.toPlainText()
+        if current_result:
+            # 将结果添加到历史记录
+            self.append_to_history(self.query_input.toPlainText(), current_result)
+            print("Search result added to history")  # 调试输出
+        
+        # 重置浏览器到默认页面
+        self.web_view.setUrl(self.default_url)
+        self.status_display.append("搜索完成，浏览器已重置到首页")
+
+    def add_batch_tasks_button(self):
+        """添加批量任务按钮"""
+        batch_button = QPushButton("批量任务")
+        batch_button.clicked.connect(self.show_batch_dialog)
+        return batch_button
+
+    def show_batch_dialog(self):
+        """显示批量任务设置对话框"""
+        dialog = BatchTaskDialog(self)
+        
+        # 恢复之前的任务
+        for task in self.scheduled_tasks:
+            current_row = dialog.table.rowCount()
+            dialog.table.insertRow(current_row)
+            
+            # 设置需求内容
+            content_item = QTableWidgetItem(task['content'])
+            dialog.table.setItem(current_row, 0, content_item)
+            
+            # 设置执行时间
+            time_widget = QTimeEdit()
+            time_widget.setDisplayFormat("HH:mm:ss")
+            time_widget.setTime(task['time'])
+            dialog.table.setCellWidget(current_row, 1, time_widget)
+            
+            # 设置状态
+            status_item = QTableWidgetItem(task['status'])
+            dialog.table.setItem(current_row, 2, status_item)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            tasks = dialog.get_tasks()
+            if tasks:
+                self.scheduled_tasks = tasks  # 保存新的任务列表
+                self.schedule_tasks(tasks)
+    
+    def schedule_tasks(self, tasks):
+        """调度任务执行"""
+        current_time = QTime.currentTime()
+        
+        for task in tasks:
+            content = task['content']
+            planned_time = task['time']
+            
+            # 计算延迟时间（毫秒）
+            delay = current_time.msecsTo(planned_time)
+            if delay < 0:  # 如果计划时间早于当前时间，安排在明天同一时间
+                delay += 24 * 3600 * 1000
+            
+            # 创建定时器
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda q=content: self.execute_scheduled_task(q))
+            timer.start(delay)
+            
+            # 更新任务状态
+            for stored_task in self.scheduled_tasks:
+                if stored_task['content'] == content:
+                    stored_task['status'] = "已计划"
+    
+    def execute_scheduled_task(self, query):
+        """执行计划任务"""
+        self.query_input.setPlainText(query)
+        self.start_search()
+        
+        # 更新任务状态
+        for task in self.scheduled_tasks:
+            if task['content'] == query:
+                task['status'] = "已完成"
+
+    def append_status(self, text):
+        """更新状态显示"""
+        self.status_display.clear()  # 清除之前的内容
+        self.status_display.append(text)  # 只显示最新状态
+
+    def show_history(self):
+        """显示历史记录对话框"""
+        dialog = HistoryDialog(self)
+        
+        # 显示所有历史记录
+        for record in self.history_records:
+            dialog.history_display.append(record)
+            dialog.history_display.append("\n" + "="*50 + "\n")  # 分隔线
+        
+        print(f"Showing {len(self.history_records)} history records")  # 调试输出
+        dialog.exec()
+    
+    def append_to_history(self, query: str, result: str):
+        """添加搜索结果到历史记录"""
+        current_time = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
+        history_entry = f"时间：{current_time}\n需求：{query}\n结果：\n{result}"
+        self.history_records.append(history_entry)
+        print(f"Added to history: {history_entry}")  # 调试输出
+
+def main():
+    app = QApplication(sys.argv + [
+        '--disable-web-security',  # 禁用网页安全限制
+        '--no-sandbox',  # 禁用沙箱
+        '--disable-gpu',  # 禁用GPU加速
+        '--disable-software-rasterizer',  # 禁用软件光栅化
+        '--disable-dev-shm-usage',  # 禁用/dev/shm使用
+        '--disable-webgl',  # 禁用WebGL
+        '--disable-accelerated-2d-canvas',  # 禁用加速2D画布
+    ])
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
